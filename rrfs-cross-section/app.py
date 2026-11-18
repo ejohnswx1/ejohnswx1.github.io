@@ -176,6 +176,7 @@ def get_static_orog(s3_url: str) -> xr.DataArray | None:
             f"{base_dir}/rrfs.t{hh}z.natlev.3km.f000.{domain}.grib2",
             f"{base_dir}/rrfs.t{hh}z.2d.3km.f000.conus.grib2",
             f"{base_dir}/rrfs.t{hh}z.2d.3km.f000.na.grib2",
+            s3_url
         ]
 
         downloaded = False
@@ -442,8 +443,11 @@ def load_prepared_dataset(nc_path: str, orog_full: xr.DataArray | None) -> tuple
         orog_matched = np.zeros((ds_3d.sizes["y"], ds_3d.sizes["x"]), dtype=np.float32)
     elif ds_3d.sizes["y"] == orog_full.sizes["y"] and ds_3d.sizes["x"] == orog_full.sizes["x"]:
         orog_matched = orog_full.values
+    elif "y" in ds_3d.coords and "x" in ds_3d.coords and "y" in orog_full.coords:
+        orog_matched = orog_full.sel(y=ds_3d["y"], x=ds_3d["x"]).values
     else:
         full_lons = orog_full["longitude"].values
+        full_lons = np.where(full_lons > 180, full_lons - 360, full_lons)
         full_lats = orog_full["latitude"].values
         dist0 = (full_lats - float(lats.values[0, 0])) ** 2 + (full_lons - float(lons.values[0, 0])) ** 2
         y0, x0 = np.unravel_index(np.argmin(dist0), dist0.shape)
