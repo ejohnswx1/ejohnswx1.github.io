@@ -151,35 +151,61 @@ def resolve_cycle(run: str, fhour: str):
     raise FileNotFoundError("Could not locate an available RRFS cycle on AWS S3.")
 
 
-def get_static_orog(s3_url: str) -> xr.DataArray:
-    """Download HGT:surface once into ./Data/rrfs_orog.grib2 (~3 MB) and keep it in RAM."""
+def get_static_orog(s3_url: str) -> xr.DataArray | None:
+    """Download HGT:surface once from RRFS 2D/natlev f000 on S3 into ./Data/rrfs_orog.grib2 (~3 MB)."""
     global CACHED_OROG_DA
     if CACHED_OROG_DA is not None:
         return CACHED_OROG_DA
 
     if not (os.path.exists(OROG_PATH) and os.path.getsize(OROG_PATH) > 50_000):
         os.makedirs(DATA_DIR, exist_ok=True)
-        idx_lines = urllib.request.urlopen(s3_url + ".idx", timeout=10).read().decode("utf-8").splitlines()
-        records = []
-        for line in idx_lines:
-            parts = line.split(":")
-            if len(parts) >= 5:
-                records.append({"start": int(parts[1]), "var": parts[3].strip(), "level": parts[4].strip()})
-        records.sort(key=lambda r: r["start"])
-        for i in range(len(records) - 1):
-            records[i]["end"] = records[i + 1]["start"] - 1
-        records[-1]["end"] = None
 
-        orog_rec = next((r for r in records if r["var"] == "HGT" and r["level"] == "surface"), None)
-        if orog_rec is None:
-            raise RuntimeError("HGT:surface not found in RRFS .idx")
+        # Extract base directory and cycle (e.g., https://.../rrfs.20261117/18) from s3_url
+        base_dir, fname = s3_url.rsplit("/", 1)
+        hh = fname.split(".")[1][1:3]  # "t18z" -> "18"
+        domain = "na" if fname.endswith(".na.grib2") else "conus"
 
-        end_str = "" if orog_rec["end"] is None else str(orog_rec["end"])
-        req = urllib.request.Request(s3_url, headers={"Range": f"bytes={orog_rec['start']}-{end_str}"})
-        tmp_file = f"{OROG_PATH}.{os.getpid()}.tmp"
-        with urllib.request.urlopen(req, timeout=30) as resp, open(tmp_file, "wb") as f_out:
-            f_out.write(resp.read())
-        os.replace(tmp_file, OROG_PATH)
+        # HGT:surface lives in the 2d or natlev files (check f000 since terrain is static)
+        candidate_urls = [
+            f"{base_dir}/rrfs.t{hh}z.2d.3km.f000.{domain}.grib2",
+            f"{base_dir}/rrfs.t{hh}z.natlev.3km.f000.{domain}.grib2",
+            f"{base_dir}/rrfs.t{hh}z.2d.3km.f000.conus.grib2",
+            f"{base_dir}/rrfs.t{hh}z.2d.3km.f000.na.grib2",
+        ]
+
+        downloaded = False
+        for url in dict.fromkeys(candidate_urls):
+            try:
+                idx_lines = urllib.request.urlopen(url + ".idx", timeout=10).read().decode("utf-8").splitlines()
+                records = []
+                for line in idx_lines:
+                    parts = line.split(":")
+                    if len(parts) >= 5:
+                        records.append({"start": int(parts[1]), "var": parts[3].strip(), "level": parts[4].strip()})
+                records.sort(key=lambda r: r["start"])
+                for i in range(len(records) - 1):
+                    records[i]["end"] = records[i + 1]["start"] - 1
+                records[-1]["end"] = None
+
+                orog_rec = next((r for r in records if r["var"] == "HGT" and r["level"] == "surface"), None)
+                if orog_rec is None:
+                    continue
+
+                end_str = "" if orog_rec["end"] is None else str(orog_rec["end"])
+                req = urllib.request.Request(url, headers={"Range": f"bytes={orog_rec['start']}-{end_str}"})
+                tmp_file = f"{OROG_PATH}.{os.getpid()}.tmp"
+                with urllib.request.urlopen(req, timeout=30) as resp, open(tmp_file, "wb") as f_out:
+                    f_out.write(resp.read())
+                os.replace(tmp_file, OROG_PATH)
+                downloaded = True
+                print(f"[INFO] Downloaded static terrain from {url}")
+                break
+            except Exception:
+                continue
+
+        if not downloaded:
+            print("[WARN] Could not fetch HGT:surface from 2d/natlev; falling back to 0m terrain.")
+            return None
 
     ds_sfc = xr.open_dataset(
         OROG_PATH,
@@ -187,6 +213,7 @@ def get_static_orog(s3_url: str) -> xr.DataArray:
         backend_kwargs={"filter_by_keys": {"typeOfLevel": "surface", "shortName": "orog"}, "indexpath": ""}
     )
     CACHED_OROG_DA = ds_sfc["orog"].load()
+    ds_sfc.close()
     return CACHED_OROG_DA
 
 
@@ -313,6 +340,8 @@ def load_prepared_dataset(nc_path: str, orog_full: xr.DataArray) -> tuple:
     xyz = rrfs_crs.transform_points(ccrs.PlateCarree(), lons.values, lats.values)
 
     # Match static CONUS orog to the cropped subregion grid
+    if orog_full is None:
+        orog_matched = np.zeros((ds_3d.sizes["y"], ds_3d.sizes["x"]), dtype=np.float32)
     if ds_3d.sizes["y"] == orog_full.sizes["y"] and ds_3d.sizes["x"] == orog_full.sizes["x"]:
         orog_matched = orog_full.values
     else:
