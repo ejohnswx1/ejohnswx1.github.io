@@ -592,7 +592,7 @@ def generate_cross_section(
                 u_earth, v_earth = cross["u"].values, cross["v"].values
 
             wind_spd = mpcalc.wind_speed(u_earth * units("m/s"), v_earth * units("m/s")).to("kt").magnitude
-            temp_c = cross["t"].values - 273.15
+            temp_c = (cross["t"].values - 273.15)*(9/5) + 32 # actually in fahrenheigt
 
             # Thread-safe object-oriented Matplotlib Figure (avoids global pyplot state collisions)
             fig = Figure(figsize=(12, 10), dpi=120)
@@ -638,13 +638,13 @@ def generate_cross_section(
             ax1.set_title("Wind Speed (kt), Wind Barbs & Isobars")
             ax1.legend(loc="upper right")
 
-            tmin = np.floor(np.nanmin(temp_c[visible_mask]) / 5.0) * 5.0
-            tmax = np.ceil(np.nanmax(temp_c[visible_mask]) / 5.0) * 5.0
-            cf2 = ax2.contourf(X_2d, Z_2d, temp_c, levels=np.arange(tmin, tmax + 2.5, 2.5), cmap="RdYlBu_r", extend="both")
-            fig.colorbar(cf2, ax=ax2, pad=0.02, label="Temperature (°C)")
-
-            cs_0 = ax2.contour(X_2d, Z_2d, temp_c, levels=[0], colors="black", linewidths=2.0, zorder=6)
-            ax2.clabel(cs_0, fmt="0°C", fontsize=9, inline=True)
+            tmin = np.floor(np.nanmin(temp_c[visible_mask]) / 10.0) * 10.0
+            tmax = np.ceil(np.nanmax(temp_c[visible_mask]) / 10.0) * 10.0
+            cf2 = ax2.contourf(X_2d, Z_2d, temp_c, levels=np.arange(tmin, tmax + 5.0, 5.0), cmap="RdYlBu_r", extend="both")
+            fig.colorbar(cf2, ax=ax2, pad=0.02, label="Temperature (°F)")
+            
+            cs_0 = ax2.contour(X_2d, Z_2d, temp_c, levels=[32], colors="black", linewidths=2.0, zorder=6)
+            ax2.clabel(cs_0, fmt="32°F", fontsize=9, inline=True)
             cs_p2 = ax2.contour(
                 X_2d, Z_2d, P_2d, levels=[250, 300, 400, 500, 600, 650, 700, 750, 800, 850, 925, 1000],
                 colors="dimgray", linestyles="--", linewidths=0.9, alpha=0.85,
@@ -656,7 +656,7 @@ def generate_cross_section(
             ax2.set_xlim(0, dist_km[-1])
             ax2.set_xlabel(f"Distance Along Transect (km)  |  Start: ({lat1:.3f}, {lon1:.3f}) → End: ({lat2:.3f}, {lon2:.3f})")
             ax2.set_ylabel("Geopotential Height (m ASL)")
-            ax2.set_title("Air Temperature (°C) & 0°C Freezing Level")
+            ax2.set_title("Air Temperature (°F) & 32°F Freezing Level")
             ax2.legend(loc="upper right")
 
             fig.suptitle(
