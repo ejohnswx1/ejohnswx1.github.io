@@ -172,13 +172,14 @@ def get_static_orog(s3_url: str) -> xr.DataArray | None:
         domain = "na" if fname.endswith(".na.grib2") else "conus"
 
         candidate_urls = [
-            f"{base_dir}/rrfs.t{hh}z.2d.3km.f000.{domain}.grib2",
+            f"{base_dir}/rrfs.t{hh}z.2dfld.3km.f000.{domain}.grib2",
+            f"{base_dir}/rrfs.t{hh}z.2dfld.3km.f001.{domain}.grib2",
             f"{base_dir}/rrfs.t{hh}z.natlev.3km.f000.{domain}.grib2",
-            f"{base_dir}/rrfs.t{hh}z.2d.3km.f000.conus.grib2",
-            f"{base_dir}/rrfs.t{hh}z.2d.3km.f000.na.grib2",
-            s3_url
+            f"{base_dir}/rrfs.t{hh}z.2dfld.3km.f000.conus.grib2",
+            f"{base_dir}/rrfs.t{hh}z.2dfld.3km.f000.na.grib2",
+            s3_url,
         ]
-
+        
         downloaded = False
         for url in dict.fromkeys(candidate_urls):
             tmp_grib = os.path.join(tempfile.gettempdir(), f"orog_{os.getpid()}.grib2")
