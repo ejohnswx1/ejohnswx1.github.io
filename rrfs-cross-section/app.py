@@ -619,7 +619,7 @@ def generate_cross_section(
             fig.colorbar(cf1, ax=ax1, pad=0.02, label="Wind Speed (kt)")
 
             cs_p1 = ax1.contour(
-                X_2d, Z_2d, P_2d, levels=[250, 300, 400, 500, 700, 850, 925, 1000],
+                X_2d, Z_2d, P_2d, levels=[250, 300, 400, 500, 600, 650, 700, 750, 800, 850, 925, 1000],
                 colors="white", linestyles="--", linewidths=0.9, alpha=0.85,
             )
             ax1.clabel(cs_p1, fmt="%d hPa", fontsize=8, inline=True)
@@ -646,7 +646,7 @@ def generate_cross_section(
             cs_0 = ax2.contour(X_2d, Z_2d, temp_c, levels=[0], colors="black", linewidths=2.0, zorder=6)
             ax2.clabel(cs_0, fmt="0°C", fontsize=9, inline=True)
             cs_p2 = ax2.contour(
-                X_2d, Z_2d, P_2d, levels=[250, 300, 400, 500, 700, 850, 925, 1000],
+                X_2d, Z_2d, P_2d, levels=[250, 300, 400, 500, 600, 650, 700, 750, 800, 850, 925, 1000],
                 colors="dimgray", linestyles="--", linewidths=0.9, alpha=0.85,
             )
             ax2.clabel(cs_p2, fmt="%d hPa", fontsize=8, inline=True)
