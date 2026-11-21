@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 import metpy.calc as mpcalc
 from metpy.units import units
 from metpy.interpolate import cross_section
@@ -52,7 +53,7 @@ MAX_CACHE_FILES = 10
 # Every 50 mb from 1000 mb up to 250 mb (16 levels)
 TARGET_LEVELS_MB = set(range(250, 1001, 50))
 
-# Prioritize full prslev first because it includes RWMR, SNMR, and GRLE on pressure levels
+# Prioritize full prslev first because it includes RWMR, SNMR, GRLE, and 1000m REFD
 S3_TEMPLATES = [
     f"{S3_BUCKET_URL}/rrfs.{{ymd}}/{{hh}}/rrfs.t{{hh}}z.prslev.3km.f{{fhour}}.conus.grib2",
     f"{S3_BUCKET_URL}/rrfs.{{ymd}}/{{hh}}/rrfs.t{{hh}}z.prslev.3km.f{{fhour}}.na.grib2",
@@ -288,7 +289,7 @@ def get_static_orog(s3_url: str) -> xr.DataArray | None:
 def fetch_s3_cropped(
     s3_url: str, ymd: str, hh: str, fhour: str, lat1: float, lon1: float, lat2: float, lon2: float
 ) -> str:
-    """Download 16 pressure levels (HGT, U, V, T, RWMR, SNMR, GRLE) via HTTP Range and crop via eccodes."""
+    """Download 16 pressure levels + 1000m AGL REFD via HTTP Range, decode/crop one GRIB message at a time via eccodes."""
     pad = 1.5
     top_lat = min(60.0, max(lat1, lat2) + pad)
     bot_lat = max(15.0, min(lat1, lat2) - pad)
@@ -296,7 +297,7 @@ def fetch_s3_cropped(
     right_lon = min(-55.0, max(lon1, lon2) + pad)
 
     bbox_tag = f"{ymd}_{hh}z_f{fhour}_{bot_lat:.1f}_{top_lat:.1f}_{left_lon:.1f}_{right_lon:.1f}"
-    nc_cache_path = os.path.join(CACHE_DIR, f"rrfs_s3crop_v2_{bbox_tag}.nc")
+    nc_cache_path = os.path.join(CACHE_DIR, f"rrfs_s3crop_v3_{bbox_tag}.nc")
 
     if os.path.exists(nc_cache_path) and os.path.getsize(nc_cache_path) > 10_000:
         try:
@@ -333,7 +334,10 @@ def fetch_s3_cropped(
                         selected.append(r)
                 except ValueError:
                     continue
+            elif r["var"] == "REFD" and r["level"] == "1000 m above ground":
+                selected.append(r)
 
+        selected.sort(key=lambda r: r["start"])
         merged = []
         for r in selected:
             if merged and merged[-1]["end"] is not None and r["start"] == merged[-1]["end"] + 1:
@@ -355,13 +359,14 @@ def fetch_s3_cropped(
                     f_out.write(data_bytes)
             release_memory()
 
-            all_vars = ("gh", "u", "v", "t", "rwmr", "snmr", "grle")
+            all_vars_3d = ("gh", "u", "v", "t", "rwmr", "snmr", "grle")
             levels_sorted = sorted(TARGET_LEVELS_MB, reverse=True)
             level_to_idx = {lvl: i for i, lvl in enumerate(levels_sorted)}
 
             y_slice = x_slice = None
             sub_lats = sub_lons = None
             arrays = {}
+            refd_1km = None
             u_attrs = {}
             init_dt = valid_dt = None
             fhr_int = int(fhour)
@@ -372,34 +377,6 @@ def fetch_s3_cropped(
                     if gid is None:
                         break
                     try:
-                        short_name = eccodes.codes_get(gid, "shortName")
-                        if short_name in {"gh", "u", "v", "t", "rwmr", "snmr", "grle"}:
-                            vname = short_name
-                        else:
-                            # Fallback to WMO GRIB2 parameterCategory / parameterNumber
-                            param_cat = eccodes.codes_get(gid, "parameterCategory")
-                            param_num = eccodes.codes_get(gid, "parameterNumber")
-                            if (param_cat, param_num) == (3, 5):
-                                vname = "gh"
-                            elif (param_cat, param_num) == (0, 0):
-                                vname = "t"
-                            elif (param_cat, param_num) == (2, 2):
-                                vname = "u"
-                            elif (param_cat, param_num) == (2, 3):
-                                vname = "v"
-                            elif (param_cat, param_num) == (1, 22):
-                                vname = "rwmr"
-                            elif (param_cat, param_num) == (1, 25):
-                                vname = "snmr"
-                            elif (param_cat, param_num) == (1, 32):
-                                vname = "grle"
-                            else:
-                                continue
-
-                        lvl = int(eccodes.codes_get(gid, "level"))
-                        if lvl not in level_to_idx:
-                            continue
-
                         ny = eccodes.codes_get(gid, "Nj")
                         nx = eccodes.codes_get(gid, "Ni")
 
@@ -424,15 +401,52 @@ def fetch_s3_cropped(
                             sub_nx = x_slice.stop - x_slice.start
                             for k in ("gh", "u", "v", "t"):
                                 arrays[k] = np.full((len(levels_sorted), sub_ny, sub_nx), np.nan, dtype=np.float32)
-                            # Default hydrometeor mixing ratios to 0.0 so fallback files without microphysics still plot cleanly
                             for k in ("rwmr", "snmr", "grle"):
                                 arrays[k] = np.zeros((len(levels_sorted), sub_ny, sub_nx), dtype=np.float32)
+                            refd_1km = np.full((sub_ny, sub_nx), -20.0, dtype=np.float32)
 
                             data_date = str(eccodes.codes_get(gid, "dataDate"))
                             data_time = f"{int(eccodes.codes_get(gid, 'dataTime')):04d}"
                             init_dt = pd.to_datetime(f"{data_date}{data_time}", format="%Y%m%d%H%M")
                             fhr_int = int(eccodes.codes_get(gid, "forecastTime"))
                             valid_dt = init_dt + pd.Timedelta(hours=fhr_int)
+
+                        type_of_level = eccodes.codes_get(gid, "typeOfLevel")
+                        lvl = int(eccodes.codes_get(gid, "level"))
+
+                        # Check for 1000 m AGL 2D reflectivity
+                        if type_of_level == "heightAboveGround" and lvl == 1000:
+                            vals_2d = eccodes.codes_get_values(gid).reshape(ny, nx)
+                            sub_vals = vals_2d[y_slice, x_slice].astype(np.float32)
+                            refd_1km = np.where((sub_vals < -30.0) | (sub_vals > 95.0) | np.isnan(sub_vals), -20.0, sub_vals)
+                            del vals_2d, sub_vals
+                            continue
+
+                        if type_of_level != "isobaricInhPa" or lvl not in level_to_idx:
+                            continue
+
+                        short_name = eccodes.codes_get(gid, "shortName")
+                        if short_name in {"gh", "u", "v", "t", "rwmr", "snmr", "grle"}:
+                            vname = short_name
+                        else:
+                            param_cat = eccodes.codes_get(gid, "parameterCategory")
+                            param_num = eccodes.codes_get(gid, "parameterNumber")
+                            if (param_cat, param_num) == (3, 5):
+                                vname = "gh"
+                            elif (param_cat, param_num) == (0, 0):
+                                vname = "t"
+                            elif (param_cat, param_num) == (2, 2):
+                                vname = "u"
+                            elif (param_cat, param_num) == (2, 3):
+                                vname = "v"
+                            elif (param_cat, param_num) == (1, 22):
+                                vname = "rwmr"
+                            elif (param_cat, param_num) == (1, 25):
+                                vname = "snmr"
+                            elif (param_cat, param_num) == (1, 32):
+                                vname = "grle"
+                            else:
+                                continue
 
                         if vname == "u" and not u_attrs:
                             u_attrs = {
@@ -452,8 +466,11 @@ def fetch_s3_cropped(
                     finally:
                         eccodes.codes_release(gid)
 
+            data_vars = {k: (("isobaricInhPa", "y", "x"), arrays[k]) for k in all_vars_3d}
+            data_vars["refd_1km"] = (("y", "x"), refd_1km)
+
             ds_crop = xr.Dataset(
-                {k: (("isobaricInhPa", "y", "x"), arrays[k]) for k in all_vars},
+                data_vars,
                 coords={
                     "isobaricInhPa": np.array(levels_sorted, dtype=np.float32),
                     "latitude": (("y", "x"), sub_lats),
@@ -468,10 +485,10 @@ def fetch_s3_cropped(
             ds_crop["u"].attrs = u_attrs
 
             tmp_nc = f"{nc_cache_path}.{os.getpid()}_{threading.get_ident()}.tmp.nc"
-            encoding = {v: {"zlib": True, "complevel": 1} for v in all_vars}
+            encoding = {v: {"zlib": True, "complevel": 1} for v in data_vars}
             ds_crop.to_netcdf(tmp_nc, encoding=encoding)
             ds_crop.close()
-            del ds_crop, arrays, sub_lats, sub_lons
+            del ds_crop, arrays, refd_1km, sub_lats, sub_lons
             os.replace(tmp_nc, nc_cache_path)
             release_memory()
             return nc_cache_path
@@ -517,7 +534,7 @@ def load_prepared_dataset(nc_path: str, orog_full: xr.DataArray | None) -> tuple
         y0, x0 = np.unravel_index(np.argmin(dist0), dist0.shape)
         orog_matched = orog_full.values[y0 : y0 + ds_3d.sizes["y"], x0 : x0 + ds_3d.sizes["x"]]
 
-    loaded_vars = [v for v in ["gh", "u", "v", "t", "rwmr", "snmr", "grle"] if v in ds_3d]
+    loaded_vars = [v for v in ["gh", "u", "v", "t", "rwmr", "snmr", "grle", "refd_1km"] if v in ds_3d]
     ds = ds_3d[loaded_vars].load()
     ds["orog"] = (("y", "x"), orog_matched)
     ds = ds.assign_coords(
@@ -547,7 +564,6 @@ def load_prepared_dataset(nc_path: str, orog_full: xr.DataArray | None) -> tuple
 
 def compute_thompson_dbz(p_mb: np.ndarray, temp_k: np.ndarray, rwmr: np.ndarray, snmr: np.ndarray, grle: np.ndarray) -> np.ndarray:
     """Compute equivalent radar reflectivity (dBZ) from Thompson microphysics species (rain, snow, graupel)."""
-    # Moist/dry air density rho = P / (Rd * T) in kg/m^3
     p_pa = p_mb * 100.0
     rho = p_pa / (287.05 * np.maximum(temp_k, 150.0))
 
@@ -555,16 +571,13 @@ def compute_thompson_dbz(p_mb: np.ndarray, temp_k: np.ndarray, rwmr: np.ndarray,
     qs = np.maximum(snmr, 0.0)
     qg = np.maximum(grle, 0.0)
 
-    # Smith (1984) / Thompson Z-M power-law relationships (mm^6 / m^3)
     z_rain = 3.63e9 * np.power(rho * qr, 1.75)
-    # Wet snow bright-band enhancement above 0 C (273.15 K)
     snow_coeff = np.where(temp_k > 273.15, 4.26e11, 9.80e8)
     z_snow = snow_coeff * np.power(rho * qs, 1.75)
     z_graupel = 4.33e10 * np.power(rho * qg, 1.75)
 
     z_total = z_rain + z_snow + z_graupel
-    dbz = 10.0 * np.log10(np.maximum(z_total, 1e-3))
-    return dbz
+    return 10.0 * np.log10(np.maximum(z_total, 1e-3))
 
 
 def prefetch_next_hour(run: str, next_fhour: int, lat1: float, lon1: float, lat2: float, lon2: float):
@@ -630,7 +643,9 @@ def generate_cross_section(
             ds, meta = load_prepared_dataset(nc_path, orog_full)
             t2 = time.perf_counter()
 
-            cross = cross_section(ds, (lat1, lon1), (lat2, lon2), steps=150).set_coords(("latitude", "longitude"))
+            # Subset only 3D fields for MetPy cross_section interpolation
+            ds_3d_sub = ds[["gh", "u", "v", "t", "rwmr", "snmr", "grle", "orog"]]
+            cross = cross_section(ds_3d_sub, (lat1, lon1), (lat2, lon2), steps=150).set_coords(("latitude", "longitude"))
 
             if meta["uv_grid_rel"] == 1:
                 c_xyz = meta["crs"].transform_points(
@@ -665,9 +680,13 @@ def generate_cross_section(
             grle_val = cross["grle"].values if "grle" in cross else np.zeros_like(temp_k)
             dbz_2d = compute_thompson_dbz(P_2d, temp_k, rwmr_val, snmr_val, grle_val)
 
-            # Thread-safe object-oriented Matplotlib Figure with 3 panels
-            fig = Figure(figsize=(12, 13.5), dpi=120)
-            ax1, ax2, ax3 = fig.subplots(3, 1, sharex=True, sharey=True)
+            # Single-column 4-panel vertical stack (3 cross-sections + 1 2D 1km reflectivity map)
+            fig = Figure(figsize=(12, 18.5), dpi=115)
+            gs = fig.add_gridspec(4, 1, height_ratios=[1.0, 1.0, 1.0, 1.25], hspace=0.28)
+            ax1 = fig.add_subplot(gs[0, 0])
+            ax2 = fig.add_subplot(gs[1, 0], sharex=ax1, sharey=ax1)
+            ax3 = fig.add_subplot(gs[2, 0], sharex=ax1, sharey=ax1)
+            ax_map = fig.add_subplot(gs[3, 0], projection=ccrs.PlateCarree())
 
             above_ground = Z_2d >= cross["orog"].values[None, :]
             visible_mask = (Z_2d <= ymax) & above_ground
@@ -736,24 +755,87 @@ def generate_cross_section(
 
             ax3.set_ylim(0, ymax)
             ax3.set_xlim(0, dist_km[-1])
-            ax3.set_xlabel(f"Distance Along Transect (km)  |  Start: ({lat1:.3f}, {lon1:.3f}) → End: ({lat2:.3f}, {lon2:.3f})")
+            ax3.set_xlabel(f"Distance Along Transect (km)  |  Start A: ({lat1:.3f}, {lon1:.3f}) → End B: ({lat2:.3f}, {lon2:.3f})")
             ax3.set_ylabel("Geopotential Height (m ASL)")
             ax3.set_title("3D Simulated Radar Reflectivity (dBZ, Thompson Microphysics)")
             ax3.legend(loc="upper right")
+
+            # --- Panel 4: 2D 1 km AGL Simulated Reflectivity Map + Cross-Section Line ---
+            map_lons = ds["longitude"].values
+            map_lats = ds["latitude"].values
+            refd_map = ds["refd_1km"].values if "refd_1km" in ds else np.full_like(map_lats, -20.0)
+            refd_map_masked = np.ma.masked_where(refd_map < 5.0, refd_map)
+
+            ax_map.set_facecolor("#f4f6f8")
+            ax_map.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#eef0f2", zorder=0)
+            ax_map.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="#dce8f2", zorder=0)
+            ax_map.add_feature(cfeature.COASTLINE.with_scale("50m"), linewidth=0.8, edgecolor="#444444", zorder=4)
+            ax_map.add_feature(cfeature.STATES.with_scale("50m"), linewidth=0.7, edgecolor="#666666", zorder=4)
+
+            cf_map = ax_map.pcolormesh(
+                map_lons, map_lats, refd_map_masked,
+                cmap=DBZ_CMAP, norm=DBZ_NORM, shading="auto", transform=ccrs.PlateCarree(), zorder=3,
+            )
+            fig.colorbar(
+                cf_map, ax=ax_map, pad=0.02, ticks=DBZ_LEVELS, label="1 km AGL Reflectivity (dBZ)",
+            )
+
+            ax_map.plot(
+                [lon1, lon2], [lat1, lat2],
+                color="black", linewidth=3.4, transform=ccrs.Geodetic(), zorder=6,
+            )
+            ax_map.plot(
+                [lon1, lon2], [lat1, lat2],
+                color="#ff1744", linewidth=2.0, linestyle="--", transform=ccrs.Geodetic(), zorder=7,
+                label="Cross-Section Transect",
+            )
+            ax_map.scatter(
+                [lon1, lon2], [lat1, lat2],
+                c=["#00e676", "#ff1744"], s=70, edgecolors="black", linewidths=1.3,
+                transform=ccrs.PlateCarree(), zorder=8,
+            )
+            ax_map.text(
+                lon1, lat1, "  A (Start)", fontsize=9.5, fontweight="bold", color="black",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="black", alpha=0.85),
+                transform=ccrs.PlateCarree(), zorder=9,
+            )
+            ax_map.text(
+                lon2, lat2, "  B (End)", fontsize=9.5, fontweight="bold", color="black",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="black", alpha=0.85),
+                transform=ccrs.PlateCarree(), zorder=9,
+            )
+
+            pad_view = 1.35
+            ax_map.set_extent(
+                [
+                    max(-139.5, min(lon1, lon2) - pad_view),
+                    min(-55.5, max(lon1, lon2) + pad_view),
+                    max(15.5, min(lat1, lat2) - pad_view),
+                    min(59.5, max(lat1, lat2) + pad_view),
+                ],
+                crs=ccrs.PlateCarree(),
+            )
+            gl = ax_map.gridlines(draw_labels=True, linewidth=0.5, color="gray", alpha=0.45, linestyle=":")
+            gl.top_labels = False
+            gl.right_labels = False
+            gl.xlabel_style = {"size": 8.5}
+            gl.ylabel_style = {"size": 8.5}
+            ax_map.set_title("1 km AGL Reflectivity & Transect Location")
+            ax_map.legend(loc="lower right", framealpha=0.9)
 
             fig.suptitle(
                 f"RRFS 3km Cross-Section  |  Init: {meta['init_dt']:%Y-%m-%d %HZ} (F{meta['fhr']:03d})  |  Valid: {meta['valid_dt']:%Y-%m-%d %H:%M UTC}",
                 fontsize=13, fontweight="bold",
             )
-            fig.tight_layout(rect=[0, 0, 1, 0.965])
+            fig.subplots_adjust(left=0.08, right=0.95, top=0.945, bottom=0.04)
 
             buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=120)
+            fig.savefig(buf, format="png", dpi=115)
             fig.clear()
             buf.seek(0)
             png_bytes = buf.read()
             buf.close()
-            del fig, ax1, ax2, ax3, cross, wind_spd, temp_c, temp_k, dbz_2d, dbz_masked, u_earth, v_earth
+            del fig, ax1, ax2, ax3, ax_map, cross, wind_spd, temp_c, temp_k, dbz_2d, dbz_masked, refd_map, refd_map_masked, u_earth, v_earth
             release_memory()
 
             t3 = time.perf_counter()
