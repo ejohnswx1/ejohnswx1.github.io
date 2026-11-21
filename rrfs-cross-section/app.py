@@ -53,7 +53,7 @@ MAX_CACHE_FILES = 10
 # Every 50 mb from 1000 mb up to 250 mb (16 levels)
 TARGET_LEVELS_MB = set(range(250, 1001, 50))
 
-# Prioritize full prslev first because it includes RWMR, SNMR, GRLE, and 1000m REFD
+# Prioritize full prslev first because it includes RWMR, SNMR, and GRLE
 S3_TEMPLATES = [
     f"{S3_BUCKET_URL}/rrfs.{{ymd}}/{{hh}}/rrfs.t{{hh}}z.prslev.3km.f{{fhour}}.conus.grib2",
     f"{S3_BUCKET_URL}/rrfs.{{ymd}}/{{hh}}/rrfs.t{{hh}}z.prslev.3km.f{{fhour}}.na.grib2",
@@ -198,7 +198,7 @@ def resolve_cycle(run: str, fhour: str):
 
 
 def get_static_orog(s3_url: str) -> xr.DataArray | None:
-    """Download HGT:surface once from RRFS 2D/natlev f000, store as compact float32 NetCDF, and cache in RAM."""
+    """Download HGT:surface once from RRFS 2dfld/natlev f000, store as compact float32 NetCDF, and cache in RAM."""
     global CACHED_OROG_DA
     if CACHED_OROG_DA is not None:
         return CACHED_OROG_DA
@@ -286,18 +286,73 @@ def get_static_orog(s3_url: str) -> xr.DataArray | None:
         return CACHED_OROG_DA
 
 
+def fetch_2d_refd_1km(
+    s3_url: str, y_slice: slice, x_slice: slice, sub_ny: int, sub_nx: int
+) -> np.ndarray:
+    """Download just REFD:1000 m above ground from the matching 2dfld file via HTTP Range."""
+    refd_1km = np.full((sub_ny, sub_nx), -20.0, dtype=np.float32)
+    base_dir, fname = s3_url.rsplit("/", 1)
+    url_2d = f"{base_dir}/{fname.replace('prslevnomads', '2dfld').replace('prslev', '2dfld')}"
+
+    tmp_2d = os.path.join(tempfile.gettempdir(), f"rrfs_2d_{os.getpid()}_{threading.get_ident()}.grib2")
+    try:
+        idx_lines = urllib.request.urlopen(url_2d + ".idx", timeout=10).read().decode("utf-8").splitlines()
+        records = []
+        for line in idx_lines:
+            parts = line.split(":")
+            if len(parts) >= 5:
+                records.append({"start": int(parts[1]), "var": parts[3].strip(), "level": parts[4].strip()})
+        records.sort(key=lambda r: r["start"])
+        for i in range(len(records) - 1):
+            records[i]["end"] = records[i + 1]["start"] - 1
+        records[-1]["end"] = None
+
+        rec = next((r for r in records if r["var"] == "REFD" and "1000 m" in r["level"]), None)
+        if rec is None:
+            rec = next((r for r in records if r["var"] == "REFC" and "entire atmosphere" in r["level"]), None)
+        if rec is None:
+            return refd_1km
+
+        end_str = "" if rec["end"] is None else str(rec["end"])
+        req = urllib.request.Request(url_2d, headers={"Range": f"bytes={rec['start']}-{end_str}"})
+        with urllib.request.urlopen(req, timeout=20) as resp, open(tmp_2d, "wb") as f_out:
+            f_out.write(resp.read())
+
+        with open(tmp_2d, "rb") as f:
+            gid = eccodes.codes_grib_new_from_file(f)
+            if gid is not None:
+                try:
+                    ny = eccodes.codes_get(gid, "Nj")
+                    nx = eccodes.codes_get(gid, "Ni")
+                    vals_2d = eccodes.codes_get_values(gid).reshape(ny, nx)
+                    sub_vals = vals_2d[y_slice, x_slice].astype(np.float32)
+                    refd_1km = np.where(
+                        (sub_vals < -30.0) | (sub_vals > 95.0) | np.isnan(sub_vals), -20.0, sub_vals
+                    )
+                    del vals_2d, sub_vals
+                finally:
+                    eccodes.codes_release(gid)
+    except Exception as e:
+        print(f"[WARN] Could not fetch 2dfld REFD: {e}")
+    finally:
+        if os.path.exists(tmp_2d):
+            os.remove(tmp_2d)
+
+    return refd_1km
+
+
 def fetch_s3_cropped(
     s3_url: str, ymd: str, hh: str, fhour: str, lat1: float, lon1: float, lat2: float, lon2: float
 ) -> str:
-    """Download 16 pressure levels + 1000m AGL REFD via HTTP Range, decode/crop one GRIB message at a time via eccodes."""
-    pad = 1.5
+    """Download 16 pressure levels from prslev + 1000m AGL REFD from 2dfld via HTTP Range, cropped via eccodes."""
+    pad = 2.5
     top_lat = min(60.0, max(lat1, lat2) + pad)
     bot_lat = max(15.0, min(lat1, lat2) - pad)
     left_lon = max(-140.0, min(lon1, lon2) - pad)
     right_lon = min(-55.0, max(lon1, lon2) + pad)
 
     bbox_tag = f"{ymd}_{hh}z_f{fhour}_{bot_lat:.1f}_{top_lat:.1f}_{left_lon:.1f}_{right_lon:.1f}"
-    nc_cache_path = os.path.join(CACHE_DIR, f"rrfs_s3crop_v3_{bbox_tag}.nc")
+    nc_cache_path = os.path.join(CACHE_DIR, f"rrfs_s3crop_v4_{bbox_tag}.nc")
 
     if os.path.exists(nc_cache_path) and os.path.getsize(nc_cache_path) > 10_000:
         try:
@@ -334,8 +389,6 @@ def fetch_s3_cropped(
                         selected.append(r)
                 except ValueError:
                     continue
-            elif r["var"] == "REFD" and r["level"] == "1000 m above ground":
-                selected.append(r)
 
         selected.sort(key=lambda r: r["start"])
         merged = []
@@ -365,8 +418,8 @@ def fetch_s3_cropped(
 
             y_slice = x_slice = None
             sub_lats = sub_lons = None
+            sub_ny = sub_nx = 0
             arrays = {}
-            refd_1km = None
             u_attrs = {}
             init_dt = valid_dt = None
             fhr_int = int(fhour)
@@ -403,7 +456,6 @@ def fetch_s3_cropped(
                                 arrays[k] = np.full((len(levels_sorted), sub_ny, sub_nx), np.nan, dtype=np.float32)
                             for k in ("rwmr", "snmr", "grle"):
                                 arrays[k] = np.zeros((len(levels_sorted), sub_ny, sub_nx), dtype=np.float32)
-                            refd_1km = np.full((sub_ny, sub_nx), -20.0, dtype=np.float32)
 
                             data_date = str(eccodes.codes_get(gid, "dataDate"))
                             data_time = f"{int(eccodes.codes_get(gid, 'dataTime')):04d}"
@@ -413,15 +465,6 @@ def fetch_s3_cropped(
 
                         type_of_level = eccodes.codes_get(gid, "typeOfLevel")
                         lvl = int(eccodes.codes_get(gid, "level"))
-
-                        # Check for 1000 m AGL 2D reflectivity
-                        if type_of_level == "heightAboveGround" and lvl == 1000:
-                            vals_2d = eccodes.codes_get_values(gid).reshape(ny, nx)
-                            sub_vals = vals_2d[y_slice, x_slice].astype(np.float32)
-                            refd_1km = np.where((sub_vals < -30.0) | (sub_vals > 95.0) | np.isnan(sub_vals), -20.0, sub_vals)
-                            del vals_2d, sub_vals
-                            continue
-
                         if type_of_level != "isobaricInhPa" or lvl not in level_to_idx:
                             continue
 
@@ -465,6 +508,9 @@ def fetch_s3_cropped(
                         del vals_2d, sub_vals
                     finally:
                         eccodes.codes_release(gid)
+
+            # Fetch 1 km AGL reflectivity from matching 2dfld file on the exact same (y_slice, x_slice)
+            refd_1km = fetch_2d_refd_1km(s3_url, y_slice, x_slice, sub_ny, sub_nx)
 
             data_vars = {k: (("isobaricInhPa", "y", "x"), arrays[k]) for k in all_vars_3d}
             data_vars["refd_1km"] = (("y", "x"), refd_1km)
@@ -680,7 +726,7 @@ def generate_cross_section(
             grle_val = cross["grle"].values if "grle" in cross else np.zeros_like(temp_k)
             dbz_2d = compute_thompson_dbz(P_2d, temp_k, rwmr_val, snmr_val, grle_val)
 
-            # Single-column 4-panel vertical stack (3 cross-sections + 1 2D 1km reflectivity map)
+            # Single-column 4-panel vertical stack (3 cross-sections + 1 centered 2D 1km reflectivity map)
             fig = Figure(figsize=(12, 18.5), dpi=115)
             gs = fig.add_gridspec(4, 1, height_ratios=[1.0, 1.0, 1.0, 1.25], hspace=0.28)
             ax1 = fig.add_subplot(gs[0, 0])
@@ -760,7 +806,7 @@ def generate_cross_section(
             ax3.set_title("3D Simulated Radar Reflectivity (dBZ, Thompson Microphysics)")
             ax3.legend(loc="upper right")
 
-            # --- Panel 4: 2D 1 km AGL Simulated Reflectivity Map + Cross-Section Line ---
+            # --- Panel 4: Centered 2D 1 km AGL Simulated Reflectivity Map + Cross-Section Line ---
             map_lons = ds["longitude"].values
             map_lats = ds["latitude"].values
             refd_map = ds["refd_1km"].values if "refd_1km" in ds else np.full_like(map_lats, -20.0)
@@ -805,16 +851,22 @@ def generate_cross_section(
                 transform=ccrs.PlateCarree(), zorder=9,
             )
 
-            pad_view = 1.35
+            mid_lat = 0.5 * (lat1 + lat2)
+            mid_lon = 0.5 * (lon1 + lon2)
+            half_lat = max(1.35, 0.5 * abs(lat2 - lat1) + 0.85)
+            half_lon = half_lat * 2.35 / max(np.cos(np.radians(mid_lat)), 0.3)
+
             ax_map.set_extent(
                 [
-                    max(-139.5, min(lon1, lon2) - pad_view),
-                    min(-55.5, max(lon1, lon2) + pad_view),
-                    max(15.5, min(lat1, lat2) - pad_view),
-                    min(59.5, max(lat1, lat2) + pad_view),
+                    max(-139.5, mid_lon - half_lon),
+                    min(-55.5, mid_lon + half_lon),
+                    max(15.5, mid_lat - half_lat),
+                    min(59.5, mid_lat + half_lat),
                 ],
                 crs=ccrs.PlateCarree(),
             )
+            ax_map.set_anchor("C")
+
             gl = ax_map.gridlines(draw_labels=True, linewidth=0.5, color="gray", alpha=0.45, linestyle=":")
             gl.top_labels = False
             gl.right_labels = False
