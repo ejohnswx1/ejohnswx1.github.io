@@ -17,6 +17,7 @@ warnings.filterwarnings("ignore")
 import matplotlib
 matplotlib.use("Agg")
 from matplotlib.figure import Figure
+from matplotlib.colors import ListedColormap, BoundaryNorm
 
 import eccodes
 import numpy as np
@@ -51,10 +52,11 @@ MAX_CACHE_FILES = 10
 # Every 50 mb from 1000 mb up to 250 mb (16 levels)
 TARGET_LEVELS_MB = set(range(250, 1001, 50))
 
+# Prioritize full prslev first because it includes RWMR, SNMR, and GRLE on pressure levels
 S3_TEMPLATES = [
-    f"{S3_BUCKET_URL}/rrfs.{{ymd}}/{{hh}}/rrfs.t{{hh}}z.prslevnomads.3km.f{{fhour}}.conus.grib2",
     f"{S3_BUCKET_URL}/rrfs.{{ymd}}/{{hh}}/rrfs.t{{hh}}z.prslev.3km.f{{fhour}}.conus.grib2",
     f"{S3_BUCKET_URL}/rrfs.{{ymd}}/{{hh}}/rrfs.t{{hh}}z.prslev.3km.f{{fhour}}.na.grib2",
+    f"{S3_BUCKET_URL}/rrfs.{{ymd}}/{{hh}}/rrfs.t{{hh}}z.prslevnomads.3km.f{{fhour}}.conus.grib2",
 ]
 PREFERRED_TEMPLATE = None
 
@@ -69,6 +71,25 @@ _FETCH_LOCKS = {}
 _FETCH_LOCKS_GUARD = threading.Lock()
 _OROG_LOCK = threading.Lock()
 _RAM_CACHE_LOCK = threading.Lock()
+
+# NWS-style reflectivity colormap (5 to 70 dBZ in 5 dBZ steps)
+DBZ_LEVELS = np.arange(5, 75, 5)
+DBZ_CMAP = ListedColormap([
+    "#04e9e7",  # 5-10 dBZ (light cyan)
+    "#019ff4",  # 10-15 dBZ (medium blue)
+    "#0300f4",  # 15-20 dBZ (dark blue)
+    "#02fd02",  # 20-25 dBZ (light green)
+    "#01c501",  # 25-30 dBZ (medium green)
+    "#008e00",  # 30-35 dBZ (dark green)
+    "#fdf802",  # 35-40 dBZ (yellow)
+    "#e5bc00",  # 40-45 dBZ (yellow-orange)
+    "#fd9500",  # 45-50 dBZ (orange)
+    "#fd0000",  # 50-55 dBZ (red)
+    "#d40000",  # 55-60 dBZ (dark red)
+    "#bc0000",  # 60-65 dBZ (crimson)
+    "#f800fd",  # 65-70 dBZ (magenta)
+])
+DBZ_NORM = BoundaryNorm(DBZ_LEVELS, ncolors=DBZ_CMAP.N, clip=True)
 
 
 def get_fetch_lock(key: str) -> threading.Lock:
@@ -267,7 +288,7 @@ def get_static_orog(s3_url: str) -> xr.DataArray | None:
 def fetch_s3_cropped(
     s3_url: str, ymd: str, hh: str, fhour: str, lat1: float, lon1: float, lat2: float, lon2: float
 ) -> str:
-    """Download 16 pressure levels via HTTP Range, decode/crop one GRIB message at a time via eccodes (<40 MB RAM)."""
+    """Download 16 pressure levels (HGT, U, V, T, RWMR, SNMR, GRLE) via HTTP Range and crop via eccodes."""
     pad = 1.5
     top_lat = min(60.0, max(lat1, lat2) + pad)
     bot_lat = max(15.0, min(lat1, lat2) - pad)
@@ -275,9 +296,8 @@ def fetch_s3_cropped(
     right_lon = min(-55.0, max(lon1, lon2) + pad)
 
     bbox_tag = f"{ymd}_{hh}z_f{fhour}_{bot_lat:.1f}_{top_lat:.1f}_{left_lon:.1f}_{right_lon:.1f}"
-    nc_cache_path = os.path.join(CACHE_DIR, f"rrfs_s3crop_{bbox_tag}.nc")
+    nc_cache_path = os.path.join(CACHE_DIR, f"rrfs_s3crop_v2_{bbox_tag}.nc")
 
-    # Fast check before acquiring per-key lock
     if os.path.exists(nc_cache_path) and os.path.getsize(nc_cache_path) > 10_000:
         try:
             os.utime(nc_cache_path, None)
@@ -286,7 +306,6 @@ def fetch_s3_cropped(
         return nc_cache_path
 
     with get_fetch_lock(bbox_tag):
-        # Re-check after acquiring lock in case another concurrent request just finished writing it
         if os.path.exists(nc_cache_path) and os.path.getsize(nc_cache_path) > 10_000:
             try:
                 os.utime(nc_cache_path, None)
@@ -305,7 +324,7 @@ def fetch_s3_cropped(
             records[i]["end"] = records[i + 1]["start"] - 1
         records[-1]["end"] = None
 
-        wanted_vars = {"HGT", "UGRD", "VGRD", "TMP"}
+        wanted_vars = {"HGT", "UGRD", "VGRD", "TMP", "RWMR", "SNMR", "GRLE"}
         selected = []
         for r in records:
             if r["var"] in wanted_vars and r["level"].endswith(" mb"):
@@ -322,7 +341,6 @@ def fetch_s3_cropped(
             else:
                 merged.append({"start": r["start"], "end": r["end"]})
 
-        # Stream each byte-range directly to disk with 6 workers to minimize RAM spikes
         def download_chunk(chunk):
             end_str = "" if chunk["end"] is None else str(chunk["end"])
             req = urllib.request.Request(s3_url, headers={"Range": f"bytes={chunk['start']}-{end_str}"})
@@ -337,8 +355,7 @@ def fetch_s3_cropped(
                     f_out.write(data_bytes)
             release_memory()
 
-            # Decode ONE GRIB message at a time via eccodes and crop immediately
-            var_map = {"HGT": "gh", "UGRD": "u", "VGRD": "v", "TMP": "t"}
+            all_vars = ("gh", "u", "v", "t", "rwmr", "snmr", "grle")
             levels_sorted = sorted(TARGET_LEVELS_MB, reverse=True)
             level_to_idx = {lvl: i for i, lvl in enumerate(levels_sorted)}
 
@@ -356,7 +373,10 @@ def fetch_s3_cropped(
                         break
                     try:
                         short_name = eccodes.codes_get(gid, "shortName")
-                        if short_name not in var_map.values():
+                        if short_name in {"gh", "u", "v", "t", "rwmr", "snmr", "grle"}:
+                            vname = short_name
+                        else:
+                            # Fallback to WMO GRIB2 parameterCategory / parameterNumber
                             param_cat = eccodes.codes_get(gid, "parameterCategory")
                             param_num = eccodes.codes_get(gid, "parameterNumber")
                             if (param_cat, param_num) == (3, 5):
@@ -367,10 +387,14 @@ def fetch_s3_cropped(
                                 vname = "u"
                             elif (param_cat, param_num) == (2, 3):
                                 vname = "v"
+                            elif (param_cat, param_num) == (1, 22):
+                                vname = "rwmr"
+                            elif (param_cat, param_num) == (1, 25):
+                                vname = "snmr"
+                            elif (param_cat, param_num) == (1, 32):
+                                vname = "grle"
                             else:
                                 continue
-                        else:
-                            vname = short_name
 
                         lvl = int(eccodes.codes_get(gid, "level"))
                         if lvl not in level_to_idx:
@@ -400,6 +424,9 @@ def fetch_s3_cropped(
                             sub_nx = x_slice.stop - x_slice.start
                             for k in ("gh", "u", "v", "t"):
                                 arrays[k] = np.full((len(levels_sorted), sub_ny, sub_nx), np.nan, dtype=np.float32)
+                            # Default hydrometeor mixing ratios to 0.0 so fallback files without microphysics still plot cleanly
+                            for k in ("rwmr", "snmr", "grle"):
+                                arrays[k] = np.zeros((len(levels_sorted), sub_ny, sub_nx), dtype=np.float32)
 
                             data_date = str(eccodes.codes_get(gid, "dataDate"))
                             data_time = f"{int(eccodes.codes_get(gid, 'dataTime')):04d}"
@@ -417,13 +444,16 @@ def fetch_s3_cropped(
                             }
 
                         vals_2d = eccodes.codes_get_values(gid).reshape(ny, nx)
-                        arrays[vname][level_to_idx[lvl]] = vals_2d[y_slice, x_slice].astype(np.float32)
-                        del vals_2d
+                        sub_vals = vals_2d[y_slice, x_slice].astype(np.float32)
+                        if vname in ("rwmr", "snmr", "grle"):
+                            sub_vals = np.where((sub_vals < 0) | (sub_vals > 1.0) | np.isnan(sub_vals), 0.0, sub_vals)
+                        arrays[vname][level_to_idx[lvl]] = sub_vals
+                        del vals_2d, sub_vals
                     finally:
                         eccodes.codes_release(gid)
 
             ds_crop = xr.Dataset(
-                {k: (("isobaricInhPa", "y", "x"), arrays[k]) for k in ("gh", "u", "v", "t")},
+                {k: (("isobaricInhPa", "y", "x"), arrays[k]) for k in all_vars},
                 coords={
                     "isobaricInhPa": np.array(levels_sorted, dtype=np.float32),
                     "latitude": (("y", "x"), sub_lats),
@@ -438,7 +468,7 @@ def fetch_s3_cropped(
             ds_crop["u"].attrs = u_attrs
 
             tmp_nc = f"{nc_cache_path}.{os.getpid()}_{threading.get_ident()}.tmp.nc"
-            encoding = {v: {"zlib": True, "complevel": 1} for v in ["gh", "u", "v", "t"]}
+            encoding = {v: {"zlib": True, "complevel": 1} for v in all_vars}
             ds_crop.to_netcdf(tmp_nc, encoding=encoding)
             ds_crop.close()
             del ds_crop, arrays, sub_lats, sub_lons
@@ -487,7 +517,8 @@ def load_prepared_dataset(nc_path: str, orog_full: xr.DataArray | None) -> tuple
         y0, x0 = np.unravel_index(np.argmin(dist0), dist0.shape)
         orog_matched = orog_full.values[y0 : y0 + ds_3d.sizes["y"], x0 : x0 + ds_3d.sizes["x"]]
 
-    ds = ds_3d[["gh", "u", "v", "t"]].load()
+    loaded_vars = [v for v in ["gh", "u", "v", "t", "rwmr", "snmr", "grle"] if v in ds_3d]
+    ds = ds_3d[loaded_vars].load()
     ds["orog"] = (("y", "x"), orog_matched)
     ds = ds.assign_coords(
         x=("x", xyz[0, :, 0], {"standard_name": "projection_x_coordinate", "units": "m"}),
@@ -512,6 +543,28 @@ def load_prepared_dataset(nc_path: str, orog_full: xr.DataArray | None) -> tuple
     release_memory()
 
     return ds, meta
+
+
+def compute_thompson_dbz(p_mb: np.ndarray, temp_k: np.ndarray, rwmr: np.ndarray, snmr: np.ndarray, grle: np.ndarray) -> np.ndarray:
+    """Compute equivalent radar reflectivity (dBZ) from Thompson microphysics species (rain, snow, graupel)."""
+    # Moist/dry air density rho = P / (Rd * T) in kg/m^3
+    p_pa = p_mb * 100.0
+    rho = p_pa / (287.05 * np.maximum(temp_k, 150.0))
+
+    qr = np.maximum(rwmr, 0.0)
+    qs = np.maximum(snmr, 0.0)
+    qg = np.maximum(grle, 0.0)
+
+    # Smith (1984) / Thompson Z-M power-law relationships (mm^6 / m^3)
+    z_rain = 3.63e9 * np.power(rho * qr, 1.75)
+    # Wet snow bright-band enhancement above 0 C (273.15 K)
+    snow_coeff = np.where(temp_k > 273.15, 4.26e11, 9.80e8)
+    z_snow = snow_coeff * np.power(rho * qs, 1.75)
+    z_graupel = 4.33e10 * np.power(rho * qg, 1.75)
+
+    z_total = z_rain + z_snow + z_graupel
+    dbz = 10.0 * np.log10(np.maximum(z_total, 1e-3))
+    return dbz
 
 
 def prefetch_next_hour(run: str, next_fhour: int, lat1: float, lon1: float, lat2: float, lon2: float):
@@ -592,11 +645,8 @@ def generate_cross_section(
                 u_earth, v_earth = cross["u"].values, cross["v"].values
 
             wind_spd = mpcalc.wind_speed(u_earth * units("m/s"), v_earth * units("m/s")).to("kt").magnitude
-            temp_c = (cross["t"].values - 273.15)*(9/5) + 32 # actually in fahrenheigt
-
-            # Thread-safe object-oriented Matplotlib Figure (avoids global pyplot state collisions)
-            fig = Figure(figsize=(12, 10), dpi=120)
-            ax1, ax2 = fig.subplots(2, 1, sharex=True, sharey=True)
+            temp_k = cross["t"].values
+            temp_c = (temp_k - 273.15) * (9 / 5) + 32  # in Fahrenheit
 
             geod = Geod(ellps="WGS84")
             _, _, dist_m = geod.inv(
@@ -610,16 +660,27 @@ def generate_cross_section(
             Z_2d = cross["gh"].values
             P_2d = np.broadcast_to(cross["isobaricInhPa"].values[:, None], Z_2d.shape)
 
+            rwmr_val = cross["rwmr"].values if "rwmr" in cross else np.zeros_like(temp_k)
+            snmr_val = cross["snmr"].values if "snmr" in cross else np.zeros_like(temp_k)
+            grle_val = cross["grle"].values if "grle" in cross else np.zeros_like(temp_k)
+            dbz_2d = compute_thompson_dbz(P_2d, temp_k, rwmr_val, snmr_val, grle_val)
+
+            # Thread-safe object-oriented Matplotlib Figure with 3 panels
+            fig = Figure(figsize=(12, 13.5), dpi=120)
+            ax1, ax2, ax3 = fig.subplots(3, 1, sharex=True, sharey=True)
+
             above_ground = Z_2d >= cross["orog"].values[None, :]
             visible_mask = (Z_2d <= ymax) & above_ground
 
+            # --- Panel 1: Wind Speed (kt), Barbs & Isobars ---
             max_spd = np.nanmax(wind_spd[visible_mask])
             vmax = max(10.0, np.ceil(max_spd / 5.0) * 5.0)
             cf1 = ax1.contourf(X_2d, Z_2d, wind_spd, levels=np.linspace(0, vmax, 17), cmap="plasma", extend="neither")
             fig.colorbar(cf1, ax=ax1, pad=0.02, label="Wind Speed (kt)")
 
+            p_levels = [250, 300, 400, 500, 600, 650, 700, 750, 800, 850, 925, 1000]
             cs_p1 = ax1.contour(
-                X_2d, Z_2d, P_2d, levels=[250, 300, 400, 500, 600, 650, 700, 750, 800, 850, 925, 1000],
+                X_2d, Z_2d, P_2d, levels=p_levels,
                 colors="white", linestyles="--", linewidths=0.9, alpha=0.85,
             )
             ax1.clabel(cs_p1, fmt="%d hPa", fontsize=8, inline=True)
@@ -638,32 +699,53 @@ def generate_cross_section(
             ax1.set_title("Wind Speed (kt), Wind Barbs & Isobars")
             ax1.legend(loc="upper right")
 
+            # --- Panel 2: Air Temperature (°F) & 32°F Freezing Level ---
             tmin = np.floor(np.nanmin(temp_c[visible_mask]) / 10.0) * 10.0
             tmax = np.ceil(np.nanmax(temp_c[visible_mask]) / 10.0) * 10.0
             cf2 = ax2.contourf(X_2d, Z_2d, temp_c, levels=np.arange(tmin, tmax + 5.0, 5.0), cmap="RdYlBu_r", extend="both")
             fig.colorbar(cf2, ax=ax2, pad=0.02, label="Temperature (°F)")
-            
+
             cs_0 = ax2.contour(X_2d, Z_2d, temp_c, levels=[32], colors="black", linewidths=2.0, zorder=6)
             ax2.clabel(cs_0, fmt="32°F", fontsize=9, inline=True)
             cs_p2 = ax2.contour(
-                X_2d, Z_2d, P_2d, levels=[250, 300, 400, 500, 600, 650, 700, 750, 800, 850, 925, 1000],
+                X_2d, Z_2d, P_2d, levels=p_levels,
                 colors="dimgray", linestyles="--", linewidths=0.9, alpha=0.85,
             )
             ax2.clabel(cs_p2, fmt="%d hPa", fontsize=8, inline=True)
             ax2.fill_between(dist_km, 0, cross["orog"].values, color="#5c4033", edgecolor="black", zorder=10, label="Terrain")
-
-            ax2.set_ylim(0, ymax)
-            ax2.set_xlim(0, dist_km[-1])
-            ax2.set_xlabel(f"Distance Along Transect (km)  |  Start: ({lat1:.3f}, {lon1:.3f}) → End: ({lat2:.3f}, {lon2:.3f})")
             ax2.set_ylabel("Geopotential Height (m ASL)")
             ax2.set_title("Air Temperature (°F) & 32°F Freezing Level")
             ax2.legend(loc="upper right")
+
+            # --- Panel 3: 3D Simulated Reflectivity (dBZ, Thompson Microphysics) ---
+            dbz_masked = np.ma.masked_where((~above_ground) | (dbz_2d < 5.0), dbz_2d)
+            cf3 = ax3.contourf(
+                X_2d, Z_2d, dbz_masked,
+                levels=DBZ_LEVELS, cmap=DBZ_CMAP, norm=DBZ_NORM, extend="max",
+            )
+            fig.colorbar(cf3, ax=ax3, pad=0.02, ticks=DBZ_LEVELS, label="Simulated Reflectivity (dBZ)")
+
+            cs_0_ref = ax3.contour(X_2d, Z_2d, temp_c, levels=[32], colors="black", linestyles=":", linewidths=1.5, zorder=6)
+            ax3.clabel(cs_0_ref, fmt="32°F", fontsize=8, inline=True)
+            cs_p3 = ax3.contour(
+                X_2d, Z_2d, P_2d, levels=p_levels,
+                colors="dimgray", linestyles="--", linewidths=0.9, alpha=0.75,
+            )
+            ax3.clabel(cs_p3, fmt="%d hPa", fontsize=8, inline=True)
+            ax3.fill_between(dist_km, 0, cross["orog"].values, color="#5c4033", edgecolor="black", zorder=10, label="Terrain")
+
+            ax3.set_ylim(0, ymax)
+            ax3.set_xlim(0, dist_km[-1])
+            ax3.set_xlabel(f"Distance Along Transect (km)  |  Start: ({lat1:.3f}, {lon1:.3f}) → End: ({lat2:.3f}, {lon2:.3f})")
+            ax3.set_ylabel("Geopotential Height (m ASL)")
+            ax3.set_title("3D Simulated Radar Reflectivity (dBZ, Thompson Microphysics)")
+            ax3.legend(loc="upper right")
 
             fig.suptitle(
                 f"RRFS 3km Cross-Section  |  Init: {meta['init_dt']:%Y-%m-%d %HZ} (F{meta['fhr']:03d})  |  Valid: {meta['valid_dt']:%Y-%m-%d %H:%M UTC}",
                 fontsize=13, fontweight="bold",
             )
-            fig.tight_layout(rect=[0, 0, 1, 0.96])
+            fig.tight_layout(rect=[0, 0, 1, 0.965])
 
             buf = io.BytesIO()
             fig.savefig(buf, format="png", dpi=120)
@@ -671,7 +753,7 @@ def generate_cross_section(
             buf.seek(0)
             png_bytes = buf.read()
             buf.close()
-            del fig, ax1, ax2, cross, wind_spd, temp_c, u_earth, v_earth
+            del fig, ax1, ax2, ax3, cross, wind_spd, temp_c, temp_k, dbz_2d, dbz_masked, u_earth, v_earth
             release_memory()
 
             t3 = time.perf_counter()
